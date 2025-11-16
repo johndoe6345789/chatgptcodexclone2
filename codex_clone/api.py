@@ -59,13 +59,19 @@ def send_chat(
     messages: List[Dict[str, str]],
     config: Config,
 ) -> str:
+    """Send a chat completion request to the local HTTP backend.
+
+    Any low-level network errors are wrapped in CodexError so callers
+    can handle failures in a uniform way.
+    """
     payload = _build_payload(messages, config)
     request = _build_request(payload, config)
     log_line("HTTP chat request to local backend")
     try:
         with urllib.request.urlopen(request, timeout=600) as response:
             body = response.read()
-    except urllib.error.URLError as exc:
+    except (urllib.error.URLError, OSError) as exc:
+        # Be robust to both URLError and raw OS errors.
         log_line(f"HTTP error: {exc}")
         raise CodexError(str(exc)) from exc
     reply = _parse_response(body)

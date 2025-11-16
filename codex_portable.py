@@ -18,7 +18,13 @@ PORT = 56789
 
 
 class SocketBackendClient:
-    """JSON-over-TCP client for the socket backend."""
+    """JSON-over-TCP client for the socket backend.
+
+    - Keeps a persistent connection.
+    - Background reader thread pushes messages into queues for the UI.
+    - Auto-launches the daemon if the connection fails.
+    - Provides a best-effort shutdown() method to tell the daemon to exit.
+    """
 
     def __init__(
         self,
@@ -28,21 +34,25 @@ class SocketBackendClient:
         self._backend_log_queue = backend_log_queue
         self._chat_queue = chat_queue
         self._sock: Optional[socket.socket] = None
-        self._writer: Optional[Any] = None
+        self._writer: Optional[Any] = None  # Text IO
         self._reader_thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
         self._connected = False
         self._req_counter = 0
+        self._ever_connected = False
 
     @property
     def is_connected(self) -> bool:
         return self._connected
 
     def ensure_connected_async(self) -> None:
+        """Ensure the daemon is running and we have a connection (background)."""
+
         def worker() -> None:
             if self._connected:
                 return
             if not self._try_connect():
+                # Attempt to start daemon and reconnect
                 self._start_daemon()
                 if not self._try_connect():
                     msg = "[gui] Could not connect to socket backend."
@@ -52,6 +62,7 @@ class SocketBackendClient:
             msg = "[gui] Connected to socket backend."
             self._backend_log_queue.put(msg)
             log_line(msg)
+            self._ever_connected = True
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -61,6 +72,8 @@ class SocketBackendClient:
         except OSError as exc:
             log_line(f"[gui] socket connect failed: {exc}")
             return False
+        # Clear timeout so reads block normally; shutdown will close the socket.
+        sock.settimeout(None)
         f_out = sock.makefile("w", encoding="utf-8")
         with self._lock:
             self._sock = sock
@@ -92,7 +105,19 @@ class SocketBackendClient:
             return
         f_in = sock.makefile("r", encoding="utf-8")
         try:
-            for line in f_in:
+            while True:
+                try:
+                    line = f_in.readline()
+                except Exception as exc:  # includes TimeoutError, connection reset, etc.
+                    err = f"[gui] socket reader error: {exc}"
+                    self._backend_log_queue.put(err)
+                    log_line(err)
+                    # Surface as GUI dialog via chat_queue.
+                    self._chat_queue.put(("error", err))
+                    break
+                if not line:
+                    # EOF from daemon
+                    break
                 line = line.strip()
                 if not line:
                     continue
@@ -157,6 +182,10 @@ class SocketBackendClient:
         self._send_async(payload)
 
     def send_shutdown(self) -> None:
+        """Best-effort shutdown request to daemon.
+
+        Sends a 'shutdown' message and then closes the socket.
+        """
         with self._lock:
             if not self._connected or self._writer is None:
                 return
@@ -166,6 +195,7 @@ class SocketBackendClient:
                 self._writer.flush()
             except OSError:
                 pass
+            # Close socket; daemon will see EOF after handling shutdown.
             try:
                 if self._sock is not None:
                     self._sock.close()
@@ -422,7 +452,8 @@ def run_pyqt_app() -> int:
                 if kind == "reply":
                     self.convo.appendPlainText("ai > " + text)
                 else:
-                    QtWidgets.QMessageBox.critical(self, "Error", text)
+                    from PyQt6 import QtWidgets as QtW
+                    QtW.QMessageBox.critical(self, "Error", text)
                     self.convo.appendPlainText("err> " + text)
                 self.send_button.setEnabled(True)
                 self.prompt.setFocus()
@@ -431,12 +462,16 @@ def run_pyqt_app() -> int:
             )
 
         def _poll_backend_status(self) -> None:
+            # Auto-healing: if we were ever connected and are now disconnected,
+            # keep trying to reconnect in the background.
             if self.socket_client.is_connected:
                 self.status_label.setText(
                     "Backend: socket daemon connected (see log)"
                 )
             else:
-                self.status_label.setText("Backend: not connected")
+                self.status_label.setText("Backend: not connected (auto-reconnect)")
+                if self.socket_client._ever_connected:
+                    self.socket_client.ensure_connected_async()
 
         def _on_send(self) -> None:
             user = self.prompt.toPlainText().strip()
