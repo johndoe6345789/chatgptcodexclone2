@@ -10,7 +10,7 @@ from __future__ import annotations
 import subprocess
 import sys
 from pathlib import Path
-from typing import Final, Callable
+from typing import Final
 
 
 HF_REPO: Final[str] = "TheBloke/deepseek-coder-6.7B-instruct-GGUF"
@@ -92,7 +92,6 @@ def ensure_llama_cpp() -> bool:
 
 
 def run_llama_server(model_path: Path) -> int:
-    """Run llama_cpp.server and proxy its logs."""
     cmd = [
         sys.executable,
         "-m",

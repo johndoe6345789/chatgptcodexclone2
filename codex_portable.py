@@ -1,35 +1,43 @@
-"""One-click desktop Codex Portable GUI (helper process backend)."""
+"""Codex Portable Desktop with PyQt6 main UI and installer fallback.
+
+- On start, tries to import PyQt6.
+- If available: runs the full PyQt6 desktop app (Chat + Backend tabs).
+- If not available:
+    * Tries to show a minimal Tkinter installer UI that pip-installs PyQt6
+      and streams progress.
+    * If Tkinter is not available either, falls back to a simple curses TUI
+      to install PyQt6.
+"""
 
 from __future__ import annotations
 
-import threading
-import subprocess
 import sys
+import subprocess
+import threading
+import queue
 import platform
 from pathlib import Path
 from typing import Optional
-
-import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox
 
 from codex_clone.config import load_config, Config
 from codex_clone.api import send_chat, CodexError
 
 
-def project_root() -> Path:
-    return Path(__file__).resolve().parent
+# ---------------------------------------------------------------------------
+# Shared backend manager (helper process) and chat client
+# ---------------------------------------------------------------------------
 
 
 class BackendManager:
     """Backend manager using a *separate helper process*.
 
-    The heavy work (model download, pip, llama server) happens in
-    `python -m codex_clone.backend_helper`, and we only stream its
-    stdout into the GUI via a reader thread.
+    All heavy work lives in `python -m codex_clone.backend_helper`.
+    We only stream its stdout into a queue; the UI layer pulls
+    from that queue and updates widgets.
     """
 
-    def __init__(self, log: callable) -> None:
-        self._log = log
+    def __init__(self, log_queue: "queue.Queue[str]") -> None:
+        self._log_queue = log_queue
         self._proc: Optional[subprocess.Popen] = None
         self._lock = threading.Lock()
         self._reader_thread: Optional[threading.Thread] = None
@@ -45,10 +53,10 @@ class BackendManager:
         """Start helper process in a non-blocking way."""
         with self._lock:
             if self.is_running:
-                self._log("[gui] Backend already running.")
+                self._log_queue.put("[gui] Backend already running.")
                 return
             if self._reader_thread and self._reader_thread.is_alive():
-                self._log("[gui] Backend startup already in progress.")
+                self._log_queue.put("[gui] Backend startup already in progress.")
                 return
             cmd = [
                 sys.executable,
@@ -63,7 +71,7 @@ class BackendManager:
                     text=True,
                 )
             except Exception as exc:
-                self._log(f"[gui] ERROR: Could not start backend helper: {exc}")
+                self._log_queue.put(f"[gui] ERROR: Could not start backend helper: {exc}")
                 return
             self._proc = proc
             self._reader_thread = threading.Thread(
@@ -72,7 +80,7 @@ class BackendManager:
                 daemon=True,
             )
             self._reader_thread.start()
-            self._log("[gui] Backend helper process started.")
+            self._log_queue.put("[gui] Backend helper process started.")
 
     def _reader_worker(self) -> None:
         proc: Optional[subprocess.Popen]
@@ -81,24 +89,26 @@ class BackendManager:
         if proc is None or proc.stdout is None:
             return
         for line in proc.stdout:
-            self._log(line.rstrip())
+            self._log_queue.put(line.rstrip())
         code = proc.wait()
-        self._log(f"[gui] Backend helper exited with code {code}.")
+        self._log_queue.put(f"[gui] Backend helper exited with code {code}.")
 
     def stop(self) -> None:
         with self._lock:
             if not self.is_running:
-                self._log("[gui] No backend process to stop.")
+                self._log_queue.put("[gui] No backend process to stop.")
                 return
             assert self._proc is not None
-            self._log("[gui] Terminating backend helper...")
+            self._log_queue.put("[gui] Terminating backend helper...")
             self._proc.terminate()
 
 
 class ChatClient:
-    def __init__(self, config: Config, log: callable) -> None:
+    """Background chat client that posts results into queues."""
+
+    def __init__(self, config: Config, log_queue: "queue.Queue[str]") -> None:
         self._config = config
-        self._log = log
+        self._log_queue = log_queue
         self._messages = [
             {"role": "system", "content": self._config.system_prompt},
         ]
@@ -115,287 +125,411 @@ class ChatClient:
     def send_async(
         self,
         user_text: str,
-        on_reply: callable,
-        on_error: callable,
+        reply_queue: "queue.Queue[tuple[str, str]]",
     ) -> None:
+        """Send chat in a worker thread, push (kind, text) into reply_queue.
+
+        kind is either "reply" or "error".
+        """
+
         def worker() -> None:
             try:
                 with self._lock:
                     self._messages.append({"role": "user", "content": user_text})
                     reply = send_chat(self._messages, self._config)
                     self._messages.append({"role": "assistant", "content": reply})
-                on_reply(reply)
+                reply_queue.put(("reply", reply))
             except CodexError as error:
-                self._log(f"[error] {error}")
-                on_error(str(error))
+                self._log_queue.put(f"[error] {error}")
+                reply_queue.put(("error", str(error)))
             except Exception as exc:
-                self._log(f"[error] Unexpected: {exc}")
-                on_error(str(exc))
+                self._log_queue.put(f"[error] Unexpected: {exc}")
+                reply_queue.put(("error", str(exc)))
 
         threading.Thread(target=worker, daemon=True).start()
 
 
-class CodexApp(tk.Tk):
-    def __init__(self) -> None:
-        super().__init__()
-        self.title("Codex Portable Desktop (helper backend)")
-        self._apply_ttk_theme()
-        self._config = load_config()
-        self._chat_client = ChatClient(self._config, self._log_backend_only)
-        self._backend_manager = BackendManager(self._log_backend_only)
-        self._build_ui()
-        self._poll_backend_status()
+# ---------------------------------------------------------------------------
+# PyQt6 main UI
+# ---------------------------------------------------------------------------
 
-    def _apply_ttk_theme(self) -> None:
-        style = ttk.Style(self)
-        theme = "clam"
-        if platform.system().lower().startswith("win"):
-            for cand in ("vista", "xpnative", "clam"):
-                if cand in style.theme_names():
-                    theme = cand
+
+def run_pyqt_app() -> int:
+    """Run the main PyQt6 desktop application."""
+    from PyQt6 import QtWidgets, QtCore
+
+    class MainWindow(QtWidgets.QMainWindow):
+        def __init__(self) -> None:
+            super().__init__()
+            self.setWindowTitle("Codex Portable Desktop (PyQt6)")
+            self.resize(1000, 650)
+
+            # Queues
+            self.backend_log_queue: "queue.Queue[str]" = queue.Queue()
+            self.chat_queue: "queue.Queue[tuple[str, str]]" = queue.Queue()
+
+            # Core helpers
+            self.config: Config = load_config()
+            self.backend_manager = BackendManager(self.backend_log_queue)
+            self.chat_client = ChatClient(self.config, self.backend_log_queue)
+
+            # Build UI
+            self._build_ui()
+
+            # Timers to drain queues
+            self._backend_timer = QtCore.QTimer(self)
+            self._backend_timer.timeout.connect(self._drain_backend_log)
+            self._backend_timer.start(100)
+
+            self._chat_timer = QtCore.QTimer(self)
+            self._chat_timer.timeout.connect(self._drain_chat_queue)
+            self._chat_timer.start(80)
+
+            # Timer to poll backend status
+            self._status_timer = QtCore.QTimer(self)
+            self._status_timer.timeout.connect(self._poll_backend_status)
+            self._status_timer.start(1000)
+
+        # --- UI construction ---
+
+        def _build_ui(self) -> None:
+            tabs = QtWidgets.QTabWidget()
+            self.setCentralWidget(tabs)
+
+            # Chat tab
+            chat_tab = QtWidgets.QWidget()
+            tabs.addTab(chat_tab, "Chat")
+            self._build_chat_tab(chat_tab)
+
+            # Backend tab
+            backend_tab = QtWidgets.QWidget()
+            tabs.addTab(backend_tab, "AI Backend")
+            self._build_backend_tab(backend_tab)
+
+        def _build_chat_tab(self, parent: QtWidgets.QWidget) -> None:
+            layout = QtWidgets.QVBoxLayout(parent)
+
+            self.convo = QtWidgets.QPlainTextEdit()
+            self.convo.setReadOnly(True)
+            self.convo.setStyleSheet(
+                "background-color: #0b1020; color: #e5e7eb; font-family: Consolas, monospace;"
+            )
+            self.convo.appendPlainText(
+                "Codex Portable Desktop (PyQt6)\n"
+                "Use the AI Backend tab to start a local server or point to LM Studio.\n"
+            )
+            layout.addWidget(self.convo, stretch=1)
+
+            bottom = QtWidgets.QHBoxLayout()
+            layout.addLayout(bottom)
+
+            self.prompt = QtWidgets.QTextEdit()
+            self.prompt.setPlaceholderText("Type your code question or request here...")
+            bottom.addWidget(self.prompt, stretch=1)
+
+            self.send_button = QtWidgets.QPushButton("Send")
+            self.send_button.clicked.connect(self._on_send)
+            bottom.addWidget(self.send_button)
+
+            # Shortcut: Ctrl+Enter
+            send_shortcut = QtWidgets.QShortcut(
+                QtGui.QKeySequence("Ctrl+Return"), parent
+            )
+            send_shortcut.activated.connect(self._on_send)
+
+        def _build_backend_tab(self, parent: QtWidgets.QWidget) -> None:
+            layout = QtWidgets.QVBoxLayout(parent)
+
+            form = QtWidgets.QGridLayout()
+            layout.addLayout(form)
+
+            self.status_label = QtWidgets.QLabel("Backend: unknown")
+            font = self.status_label.font()
+            font.setBold(True)
+            self.status_label.setFont(font)
+            form.addWidget(self.status_label, 0, 0, 1, 2)
+
+            form.addWidget(QtWidgets.QLabel("Base URL:"), 1, 0)
+            self.base_url_edit = QtWidgets.QLineEdit(self.config.base_url)
+            form.addWidget(self.base_url_edit, 1, 1)
+
+            form.addWidget(QtWidgets.QLabel("Model name:"), 2, 0)
+            self.model_edit = QtWidgets.QLineEdit(self.config.model)
+            form.addWidget(self.model_edit, 2, 1)
+
+            form.addWidget(QtWidgets.QLabel("Temperature:"), 3, 0)
+            self.temp_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+            self.temp_slider.setMinimum(0)
+            self.temp_slider.setMaximum(100)
+            self.temp_slider.setValue(int(self.config.temperature * 100))
+            form.addWidget(self.temp_slider, 3, 1)
+
+            form.addWidget(QtWidgets.QLabel("Max tokens:"), 4, 0)
+            self.max_tokens_spin = QtWidgets.QSpinBox()
+            self.max_tokens_spin.setMinimum(128)
+            self.max_tokens_spin.setMaximum(32768)
+            self.max_tokens_spin.setValue(self.config.max_tokens)
+            form.addWidget(self.max_tokens_spin, 4, 1)
+
+            button_row = QtWidgets.QHBoxLayout()
+            layout.addLayout(button_row)
+
+            self.start_button = QtWidgets.QPushButton("Start Local Backend")
+            self.start_button.clicked.connect(self._on_start_backend)
+            button_row.addWidget(self.start_button)
+
+            self.stop_button = QtWidgets.QPushButton("Stop Backend")
+            self.stop_button.clicked.connect(self._on_stop_backend)
+            button_row.addWidget(self.stop_button)
+
+            self.apply_button = QtWidgets.QPushButton("Apply Settings")
+            self.apply_button.clicked.connect(self._on_apply_settings)
+            button_row.addWidget(self.apply_button)
+            button_row.addStretch(1)
+
+            self.backend_log = QtWidgets.QPlainTextEdit()
+            self.backend_log.setReadOnly(True)
+            self.backend_log.setStyleSheet(
+                "background-color: #0b1020; color: #d1d5db; font-family: Consolas, monospace;"
+            )
+            layout.addWidget(self.backend_log, stretch=1)
+
+        # --- Backend logging / chat queue draining ---
+
+        def _drain_backend_log(self) -> None:
+            while True:
+                try:
+                    line = self.backend_log_queue.get_nowait()
+                except queue.Empty:
                     break
-        style.theme_use(theme)
-        style.configure("TButton", padding=6)
-        style.configure("TNotebook", padding=4)
-        style.configure("TNotebook.Tab", padding=(10, 4))
+                self.backend_log.appendPlainText(line)
+                self.backend_log.verticalScrollBar().setValue(
+                    self.backend_log.verticalScrollBar().maximum()
+                )
 
-    def _build_ui(self) -> None:
-        self.geometry("900x600")
-        notebook = ttk.Notebook(self)
-        notebook.pack(fill=tk.BOTH, expand=True)
+        def _drain_chat_queue(self) -> None:
+            while True:
+                try:
+                    kind, text = self.chat_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if kind == "reply":
+                    self.convo.appendPlainText("ai > " + text)
+                else:
+                    QtWidgets.QMessageBox.critical(self, "Error", text)
+                    self.convo.appendPlainText("err> " + text)
+                self.send_button.setEnabled(True)
+                self.prompt.setFocus()
 
-        self._chat_frame = ttk.Frame(notebook)
-        self._backend_frame = ttk.Frame(notebook)
-
-        notebook.add(self._chat_frame, text="Chat")
-        notebook.add(self._backend_frame, text="AI Backend")
-
-        self._build_chat_tab(self._chat_frame)
-        self._build_backend_tab(self._backend_frame)
-
-    def _build_chat_tab(self, parent: ttk.Frame) -> None:
-        parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(0, weight=1)
-        parent.rowconfigure(1, weight=0)
-
-        convo = scrolledtext.ScrolledText(
-            parent,
-            wrap=tk.WORD,
-            height=20,
-            font=("Consolas", 10),
-            bg="#0b1020",
-            fg="#e5e7eb",
-        )
-        convo.grid(row=0, column=0, sticky="nsew", padx=6, pady=(6, 3))
-        convo.insert(
-            tk.END,
-            "Codex Portable Desktop (helper backend)\n"
-            "Use the AI Backend tab to start a local server, "
-            "or point to LM Studio.\n\n",
-        )
-        convo.config(state=tk.DISABLED)
-        self._convo = convo
-
-        input_frame = ttk.Frame(parent)
-        input_frame.grid(row=1, column=0, sticky="ew", padx=6, pady=(3, 6))
-        input_frame.columnconfigure(0, weight=1)
-        input_frame.columnconfigure(1, weight=0)
-
-        prompt = tk.Text(
-            input_frame,
-            height=4,
-            wrap=tk.WORD,
-            font=("Consolas", 10),
-        )
-        prompt.grid(row=0, column=0, sticky="ew", padx=(0, 6))
-        prompt.focus_set()
-        self._prompt = prompt
-
-        send_btn = ttk.Button(input_frame, text="Send", command=self._on_send)
-        send_btn.grid(row=0, column=1, sticky="e")
-        self._send_btn = send_btn
-
-        hint = ttk.Label(
-            input_frame,
-            text="Ctrl+Enter to send. Backend settings are in the AI Backend tab.",
-        )
-        hint.grid(row=1, column=0, columnspan=2, sticky="w", pady=(3, 0))
-
-        self.bind("<Control-Return>", lambda _e: self._on_send())
-        self.bind("<KP_Enter>", lambda _e: self._on_send())
-
-    def _build_backend_tab(self, parent: ttk.Frame) -> None:
-        parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(1, weight=1)
-
-        top_frame = ttk.Frame(parent)
-        top_frame.grid(row=0, column=0, sticky="ew", padx=6, pady=6)
-        top_frame.columnconfigure(1, weight=1)
-
-        self._status_var = tk.StringVar(value="Backend: unknown")
-        status_lbl = ttk.Label(
-            top_frame,
-            textvariable=self._status_var,
-            font=("Segoe UI", 10, "bold"),
-        )
-        status_lbl.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
-
-        ttk.Label(top_frame, text="Base URL:").grid(row=1, column=0, sticky="w", pady=2)
-        self._base_url_var = tk.StringVar(value=self._config.base_url)
-        base_entry = ttk.Entry(top_frame, textvariable=self._base_url_var)
-        base_entry.grid(row=1, column=1, sticky="ew", pady=2)
-
-        ttk.Label(top_frame, text="Model name:").grid(row=2, column=0, sticky="w", pady=2)
-        self._model_var = tk.StringVar(value=self._config.model)
-        model_entry = ttk.Entry(top_frame, textvariable=self._model_var)
-        model_entry.grid(row=2, column=1, sticky="ew", pady=2)
-
-        ttk.Label(top_frame, text="Temperature:").grid(row=3, column=0, sticky="w", pady=2)
-        self._temp_var = tk.DoubleVar(value=self._config.temperature)
-        temp_scale = ttk.Scale(
-            top_frame,
-            from_=0.0,
-            to=1.0,
-            orient=tk.HORIZONTAL,
-            variable=self._temp_var,
-        )
-        temp_scale.grid(row=3, column=1, sticky="ew", pady=2)
-
-        ttk.Label(top_frame, text="Max tokens:").grid(row=4, column=0, sticky="w", pady=2)
-        self._max_tokens_var = tk.IntVar(value=self._config.max_tokens)
-        max_entry = ttk.Entry(top_frame, textvariable=self._max_tokens_var, width=10)
-        max_entry.grid(row=4, column=1, sticky="w", pady=2)
-
-        button_frame = ttk.Frame(top_frame)
-        button_frame.grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
-
-        start_btn = ttk.Button(
-            button_frame,
-            text="Start Local Backend",
-            command=self._on_start_backend,
-        )
-        start_btn.grid(row=0, column=0, padx=(0, 6))
-
-        stop_btn = ttk.Button(
-            button_frame,
-            text="Stop Backend",
-            command=self._on_stop_backend,
-        )
-        stop_btn.grid(row=0, column=1, padx=(0, 6))
-
-        apply_btn = ttk.Button(
-            button_frame,
-            text="Apply Settings",
-            command=self._on_apply_settings,
-        )
-        apply_btn.grid(row=0, column=2)
-
-        log_frame = ttk.LabelFrame(parent, text="Backend log")
-        log_frame.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 6))
-        log_frame.columnconfigure(0, weight=1)
-        log_frame.rowconfigure(0, weight=1)
-
-        log_text = scrolledtext.ScrolledText(
-            log_frame,
-            wrap=tk.WORD,
-            height=10,
-            font=("Consolas", 9),
-            bg="#0b1020",
-            fg="#d1d5db",
-        )
-        log_text.grid(row=0, column=0, sticky="nsew")
-        log_text.config(state=tk.DISABLED)
-        self._backend_log = log_text
-
-    # ---- Logging helpers ----
-
-    def _append_convo(self, prefix: str, text: str) -> None:
-        self._convo.config(state=tk.NORMAL)
-        for line in text.splitlines() or [""]:
-            self._convo.insert(tk.END, f"{prefix} {line}\n")
-        self._convo.see(tk.END)
-        self._convo.config(state=tk.DISABLED)
-
-    def _log_backend(self, text: str) -> None:
-        self._backend_log.config(state=tk.NORMAL)
-        self._backend_log.insert(tk.END, text + "\n")
-        self._backend_log.see(tk.END)
-        self._backend_log.config(state=tk.DISABLED)
-
-    def _log_backend_only(self, text: str) -> None:
-        self.after(0, lambda: self._log_backend(text))
-
-    # ---- Callbacks ----
-
-    def _on_send(self) -> None:
-        user = self._prompt.get("1.0", tk.END).strip()
-        if not user:
-            return
-        self._prompt.delete("1.0", tk.END)
-        self._append_convo("you>", user)
-        self._send_btn.config(state=tk.DISABLED)
-
-        def on_reply(reply: str) -> None:
-            self.after(
-                0,
-                lambda: (
-                    self._append_convo("ai >", reply),
-                    self._send_btn.config(state=tk.NORMAL),
-                ),
+            self.convo.verticalScrollBar().setValue(
+                self.convo.verticalScrollBar().maximum()
             )
 
-        def on_error(msg: str) -> None:
-            self.after(
-                0,
-                lambda: (
-                    messagebox.showerror("Error", msg),
-                    self._send_btn.config(state=tk.NORMAL),
-                ),
+        def _poll_backend_status(self) -> None:
+            if self.backend_manager.is_running:
+                self.status_label.setText("Backend: helper running (see log)")
+            else:
+                self.status_label.setText("Backend: not running")
+
+
+        # --- UI callbacks ---
+
+        def _on_send(self) -> None:
+            user = self.prompt.toPlainText().strip()
+            if not user:
+                return
+            self.prompt.clear()
+            self.convo.appendPlainText("you> " + user)
+            self.send_button.setEnabled(False)
+            self.chat_client.send_async(user, self.chat_queue)
+
+        def _on_start_backend(self) -> None:
+            self.backend_manager.start()
+
+        def _on_stop_backend(self) -> None:
+            self.backend_manager.stop()
+
+        def _on_apply_settings(self) -> None:
+            temp = self.temp_slider.value() / 100.0
+            max_tokens = int(self.max_tokens_spin.value())
+            base_url = self.base_url_edit.text().strip() or self.config.base_url
+            model = self.model_edit.text().strip() or self.config.model
+            new_cfg = Config(
+                base_url=base_url,
+                api_key=self.config.api_key,
+                model=model,
+                system_prompt=self.config.system_prompt,
+                temperature=temp,
+                max_tokens=max_tokens,
             )
+            self.config = new_cfg
+            self.chat_client.update_config(new_cfg)
+            self.backend_log.appendPlainText("[gui] Settings applied to chat client.")
 
-        self._chat_client.send_async(user, on_reply, on_error)
+    # PyQt requires QtGui for shortcut keys
+    from PyQt6 import QtGui
 
-    def _on_start_backend(self) -> None:
-        # This call is instant; heavy work is in helper process.
-        self._backend_manager.start()
+    app = QtWidgets.QApplication(sys.argv)
+    w = MainWindow()
+    w.show()
+    return app.exec()
 
-    def _on_stop_backend(self) -> None:
-        self._backend_manager.stop()
 
-    def _on_apply_settings(self) -> None:
+# ---------------------------------------------------------------------------
+# Tkinter installer UI (if PyQt6 missing)
+# ---------------------------------------------------------------------------
+
+
+def run_tk_installer() -> int:
+    try:
+        import tkinter as tk
+        from tkinter import scrolledtext, messagebox
+    except Exception:
+        return run_curses_installer()
+
+    log_queue: "queue.Queue[str]" = queue.Queue()
+
+    def installer_thread() -> None:
+        cmd = [sys.executable, "-m", "pip", "install", "PyQt6"]
         try:
-            temp = float(self._temp_var.get())
-            max_tokens = int(self._max_tokens_var.get())
-        except ValueError:
-            messagebox.showerror(
-                "Invalid settings",
-                "Temperature must be a number and max tokens an integer.",
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
             )
+        except Exception as exc:
+            log_queue.put(f"ERROR: could not start pip: {exc}")
             return
-        new_cfg = Config(
-            base_url=self._base_url_var.get().strip() or self._config.base_url,
-            api_key=self._config.api_key,
-            model=self._model_var.get().strip() or self._config.model,
-            system_prompt=self._config.system_prompt,
-            temperature=temp,
-            max_tokens=max_tokens,
-        )
-        self._config = new_cfg
-        self._chat_client.update_config(new_cfg)
-        self._log_backend("[gui] Settings applied to chat client.")
-
-    def _poll_backend_status(self) -> None:
-        if self._backend_manager.is_running:
-            self._status_var.set("Backend: helper running (see log)")
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            log_queue.put(line.rstrip())
+        code = proc.wait()
+        log_queue.put(f"Installer exited with code {code}.")
+        if code == 0:
+            log_queue.put("PyQt6 installed successfully. Close this window and restart.")
         else:
-            self._status_var.set("Backend: not running")
-        self.after(1000, self._poll_backend_status)
+            log_queue.put("PyQt6 install failed. See output above.")
+
+    root = tk.Tk()
+    root.title("Codex Portable - PyQt6 Installer (Tkinter)")
+    root.geometry("700x400")
+
+    text = scrolledtext.ScrolledText(root, wrap=tk.WORD)
+    text.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+    text.insert(
+        tk.END,
+        "PyQt6 is not installed.\n\n"
+        "Click 'Install PyQt6' to install it into this Python environment.\n"
+        "Progress will appear here.\n\n",
+    )
+    text.config(state=tk.DISABLED)
+
+    frame = tk.Frame(root)
+    frame.pack(fill=tk.X, padx=6, pady=6)
+
+    installing = tk.BooleanVar(value=False)
+
+    def append_log(line: str) -> None:
+        text.config(state=tk.NORMAL)
+        text.insert(tk.END, line + "\n")
+        text.see(tk.END)
+        text.config(state=tk.DISABLED)
+
+    def poll_queue() -> None:
+        while True:
+            try:
+                line = log_queue.get_nowait()
+            except queue.Empty:
+                break
+            append_log(line)
+        root.after(100, poll_queue)
+
+    def on_install() -> None:
+        if installing.get():
+            return
+        installing.set(True)
+        btn.config(state=tk.DISABLED)
+        threading.Thread(target=installer_thread, daemon=True).start()
+
+    btn = tk.Button(frame, text="Install PyQt6", command=on_install)
+    btn.pack(side=tk.LEFT)
+
+    close_btn = tk.Button(frame, text="Close", command=root.destroy)
+    close_btn.pack(side=tk.RIGHT)
+
+    poll_queue()
+    root.mainloop()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Curses installer fallback
+# ---------------------------------------------------------------------------
+
+
+def run_curses_installer() -> int:
+    try:
+        import curses  # type: ignore[unused-ignore]
+    except Exception:
+        # Last resort: run pip in this terminal.
+        cmd = [sys.executable, "-m", "pip", "install", "PyQt6"]
+        return subprocess.call(cmd)
+
+    def _main(stdscr: "curses._CursesWindow") -> int:  # type: ignore[name-defined]
+        curses.curs_set(0)
+        stdscr.clear()
+        stdscr.addstr(0, 0, "PyQt6 is not installed.")
+        stdscr.addstr(1, 0, "Press 'i' to install PyQt6, 'q' to quit.")
+        stdscr.refresh()
+        while True:
+            ch = stdscr.getch()
+            if ch in (ord("q"), ord("Q")):
+                return 0
+            if ch in (ord("i"), ord("I")):
+                break
+        stdscr.clear()
+        stdscr.addstr(0, 0, "Installing PyQt6... (output will appear below)")
+        stdscr.refresh()
+        cmd = [sys.executable, "-m", "pip", "install", "PyQt6"]
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        assert proc.stdout is not None
+        y = 2
+        for line in proc.stdout:
+            if y >= curses.LINES - 1:
+                stdscr.scroll(1)
+                y = curses.LINES - 2
+            stdscr.addstr(y, 0, line[: curses.COLS - 1])
+            y += 1
+            stdscr.refresh()
+        code = proc.wait()
+        stdscr.addstr(y, 0, f"Installer exited with code {code}. Press any key.")
+        stdscr.getch()
+        return code
+
+    import curses  # type: ignore[redefined-outer-name]
+
+    return curses.wrapper(_main)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 
 def main() -> int:
-    app = CodexApp()
-    app.mainloop()
-    return 0
+    try:
+        import PyQt6  # noqa: F401
+    except Exception:
+        # No PyQt6; run installer flows
+        return run_tk_installer()
+    # If we got here, PyQt6 import works; launch the main UI.
+    return run_pyqt_app()
 
 
 if __name__ == "__main__":
