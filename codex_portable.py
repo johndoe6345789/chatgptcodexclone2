@@ -4,6 +4,7 @@ import sys
 import subprocess
 import threading
 import queue
+from pathlib import Path
 from typing import Optional
 
 from codex_clone.config import load_config, Config
@@ -11,6 +12,8 @@ from codex_clone.api import send_chat, CodexError
 
 
 class BackendManager:
+    """Helper-process backend manager with log queue."""
+
     def __init__(self, log_queue: "queue.Queue[str]") -> None:
         self._log_queue = log_queue
         self._proc: Optional[subprocess.Popen] = None
@@ -73,10 +76,14 @@ class BackendManager:
 
 
 class ChatClient:
+    """Background chat client using queues."""
+
     def __init__(self, config: Config, log_queue: "queue.Queue[str]") -> None:
         self._config = config
         self._log_queue = log_queue
-        self._messages = [{"role": "system", "content": self._config.system_prompt}]
+        self._messages = [
+            {"role": "system", "content": self._config.system_prompt},
+        ]
         self._lock = threading.Lock()
 
     @property
@@ -109,13 +116,112 @@ class ChatClient:
         threading.Thread(target=worker, daemon=True).start()
 
 
+# ---------------------- PyQt6 modern desktop UI ---------------------------
+
+
+def _apply_modern_style(app: "QtWidgets.QApplication") -> None:  # type: ignore[name-defined]
+    from PyQt6 import QtGui
+
+    dark = QtGui.QPalette()
+    dark.setColor(QtGui.QPalette.ColorRole.Window, QtGui.QColor("#0f172a"))
+    dark.setColor(QtGui.QPalette.ColorRole.WindowText, QtGui.QColor("#e5e7eb"))
+    dark.setColor(QtGui.QPalette.ColorRole.Base, QtGui.QColor("#020617"))
+    dark.setColor(QtGui.QPalette.ColorRole.AlternateBase, QtGui.QColor("#020617"))
+    dark.setColor(QtGui.QPalette.ColorRole.ToolTipBase, QtGui.QColor("#1f2937"))
+    dark.setColor(QtGui.QPalette.ColorRole.ToolTipText, QtGui.QColor("#e5e7eb"))
+    dark.setColor(QtGui.QPalette.ColorRole.Text, QtGui.QColor("#e5e7eb"))
+    dark.setColor(QtGui.QPalette.ColorRole.Button, QtGui.QColor("#111827"))
+    dark.setColor(QtGui.QPalette.ColorRole.ButtonText, QtGui.QColor("#e5e7eb"))
+    dark.setColor(QtGui.QPalette.ColorRole.BrightText, QtGui.QColor("#ffffff"))
+    dark.setColor(QtGui.QPalette.ColorRole.Highlight, QtGui.QColor("#5865F2"))
+    dark.setColor(QtGui.QPalette.ColorRole.HighlightedText, QtGui.QColor("#f9fafb"))
+    app.setPalette(dark)
+
+    # Discord-ish styling
+    app.setStyleSheet(
+        """
+        QMainWindow {
+            background-color: #0f172a;
+        }
+        QTabWidget::pane {
+            border-top: 1px solid #111827;
+            background: #020617;
+        }
+        QTabBar::tab {
+            background: #020617;
+            color: #9ca3af;
+            padding: 6px 14px;
+            border-radius: 6px 6px 0 0;
+            margin-right: 2px;
+        }
+        QTabBar::tab:selected {
+            background: #111827;
+            color: #e5e7eb;
+        }
+        QPlainTextEdit, QTextEdit {
+            background-color: #020617;
+            color: #e5e7eb;
+            border: 1px solid #1f2937;
+            border-radius: 8px;
+            padding: 6px;
+        }
+        QLineEdit, QSpinBox {
+            background-color: #020617;
+            color: #e5e7eb;
+            border: 1px solid #1f2937;
+            border-radius: 6px;
+            padding: 4px 6px;
+            selection-background-color: #3b82f6;
+        }
+        QLabel {
+            color: #9ca3af;
+        }
+        QPushButton {
+            background-color: #111827;
+            color: #e5e7eb;
+            border-radius: 8px;
+            padding: 6px 14px;
+            border: 1px solid #1f2937;
+        }
+        QPushButton:hover {
+            background-color: #1f2937;
+        }
+        QPushButton:pressed {
+            background-color: #020617;
+        }
+        QPushButton#primaryButton {
+            background-color: #5865F2;
+            border: none;
+        }
+        QPushButton#primaryButton:hover {
+            background-color: #4f5ee8;
+        }
+        QPushButton#primaryButton:pressed {
+            background-color: #4b56cf;
+        }
+        """
+    )
+
+
+def _load_app_icon() -> "Optional[object]":  # QIcon, but avoid importing in sig
+    from PyQt6 import QtGui
+
+    icon_path = Path(__file__).with_name("icon.svg")
+    if not icon_path.exists():
+        return None
+    icon = QtGui.QIcon(str(icon_path))
+    if icon.isNull():
+        return None
+    return icon
+
+
 def run_pyqt_app() -> int:
     from PyQt6 import QtWidgets, QtCore, QtGui
 
     class MainWindow(QtWidgets.QMainWindow):
         def __init__(self) -> None:
             super().__init__()
-            self.setWindowTitle("Codex Portable Desktop (PyQt6)")
+            self.setWindowTitle("Codex Portable Desktop")
             self.resize(1000, 650)
 
             self.backend_log_queue: "queue.Queue[str]" = queue.Queue()
@@ -153,12 +259,11 @@ def run_pyqt_app() -> int:
 
         def _build_chat_tab(self, parent: QtWidgets.QWidget) -> None:
             layout = QtWidgets.QVBoxLayout(parent)
+            layout.setContentsMargins(12, 12, 12, 12)
+            layout.setSpacing(10)
 
             self.convo = QtWidgets.QPlainTextEdit()
             self.convo.setReadOnly(True)
-            self.convo.setStyleSheet(
-                "background-color: #0b1020; color: #e5e7eb; font-family: Consolas, monospace;"
-            )
             self.convo.appendPlainText(
                 "Codex Portable Desktop (PyQt6)\n"
                 "Use the AI Backend tab to start a local server or point to LM Studio.\n"
@@ -166,26 +271,33 @@ def run_pyqt_app() -> int:
             layout.addWidget(self.convo, stretch=1)
 
             bottom = QtWidgets.QHBoxLayout()
+            bottom.setSpacing(8)
             layout.addLayout(bottom)
 
             self.prompt = QtWidgets.QTextEdit()
-            self.prompt.setPlaceholderText("Type your code question or request here...")
+            self.prompt.setPlaceholderText("Ask for code, refactors, or explanations...")
+            self.prompt.setFixedHeight(90)
             bottom.addWidget(self.prompt, stretch=1)
 
             self.send_button = QtWidgets.QPushButton("Send")
+            self.send_button.setObjectName("primaryButton")
             self.send_button.clicked.connect(self._on_send)
             bottom.addWidget(self.send_button)
 
-            shortcut = QtWidgets.QShortcut(
+            shortcut = QtGui.QShortcut(
                 QtGui.QKeySequence("Ctrl+Return"), parent
             )
             shortcut.activated.connect(self._on_send)
 
         def _build_backend_tab(self, parent: QtWidgets.QWidget) -> None:
-            layout = QtWidgets.QVBoxLayout(parent)
+            outer = QtWidgets.QVBoxLayout(parent)
+            outer.setContentsMargins(12, 12, 12, 12)
+            outer.setSpacing(10)
 
             form = QtWidgets.QGridLayout()
-            layout.addLayout(form)
+            form.setHorizontalSpacing(10)
+            form.setVerticalSpacing(8)
+            outer.addLayout(form)
 
             self.status_label = QtWidgets.QLabel("Backend: unknown")
             font = self.status_label.font()
@@ -216,9 +328,11 @@ def run_pyqt_app() -> int:
             form.addWidget(self.max_tokens_spin, 4, 1)
 
             button_row = QtWidgets.QHBoxLayout()
-            layout.addLayout(button_row)
+            button_row.setSpacing(8)
+            outer.addLayout(button_row)
 
             self.start_button = QtWidgets.QPushButton("Start Local Backend")
+            self.start_button.setObjectName("primaryButton")
             self.start_button.clicked.connect(self._on_start_backend)
             button_row.addWidget(self.start_button)
 
@@ -233,10 +347,7 @@ def run_pyqt_app() -> int:
 
             self.backend_log = QtWidgets.QPlainTextEdit()
             self.backend_log.setReadOnly(True)
-            self.backend_log.setStyleSheet(
-                "background-color: #0b1020; color: #d1d5db; font-family: Consolas, monospace;"
-            )
-            layout.addWidget(self.backend_log, stretch=1)
+            outer.addWidget(self.backend_log, stretch=1)
 
         def _drain_backend_log(self) -> None:
             while True:
@@ -262,7 +373,6 @@ def run_pyqt_app() -> int:
                     self.convo.appendPlainText("err> " + text)
                 self.send_button.setEnabled(True)
                 self.prompt.setFocus()
-
             self.convo.verticalScrollBar().setValue(
                 self.convo.verticalScrollBar().maximum()
             )
@@ -272,6 +382,7 @@ def run_pyqt_app() -> int:
                 self.status_label.setText("Backend: helper running (see log)")
             else:
                 self.status_label.setText("Backend: not running")
+
 
         def _on_send(self) -> None:
             user = self.prompt.toPlainText().strip()
@@ -305,10 +416,21 @@ def run_pyqt_app() -> int:
             self.chat_client.update_config(new_cfg)
             self.backend_log.appendPlainText("[gui] Settings applied to chat client.")
 
+    from PyQt6 import QtWidgets
+
     app = QtWidgets.QApplication(sys.argv)
-    w = MainWindow()
-    w.show()
+    _apply_modern_style(app)
+    icon = _load_app_icon()
+    if icon is not None:
+        app.setWindowIcon(icon)
+    window = MainWindow()
+    if icon is not None:
+        window.setWindowIcon(icon)
+    window.show()
     return app.exec()
+
+
+# ------------------ Tkinter / curses PyQt6 auto-installer -----------------
 
 
 def run_tk_installer() -> int:
@@ -371,9 +493,7 @@ def run_tk_installer() -> int:
             append_log(line)
         root.after(100, poll_queue)
 
-    # Auto-start installer thread without user clicking anything
     threading.Thread(target=installer_thread, daemon=True).start()
-
     poll_queue()
     root.mainloop()
     return 0

@@ -10,7 +10,7 @@ from .config import Config
 
 
 class CodexError(RuntimeError):
-    pass
+    """Error raised when the HTTP API fails."""
 
 
 def _build_payload(

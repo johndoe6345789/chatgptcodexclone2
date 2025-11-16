@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "codex-portable-desktop-pyqt-autoinstall"
-version = "1.0.1"
-description = "Codex-style assistant with PyQt6 UI and auto-start Tk/curses PyQt installer"
+name = "codex-portable-desktop-pyqt-modern"
+version = "1.1.0"
+description = "Codex-style assistant with modern PyQt6 UI and auto PyQt installer"
 authors = [{ name = "Local User" }]
 requires-python = ">=3.10"
 dependencies = []
