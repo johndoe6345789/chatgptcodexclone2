@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codex-portable-desktop"
-version = "0.8.0"
-description = "Local ChatGPT/Codex-style coding assistant with a non-blocking Tkinter desktop UI"
+version = "0.9.0"
+description = "Local ChatGPT/Codex-style coding assistant with a helper-process Tkinter desktop UI"
 authors = [{ name = "Local User" }]
 requires-python = ">=3.10"
 dependencies = []
