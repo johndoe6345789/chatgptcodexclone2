@@ -1,41 +1,16 @@
-"""Codex Portable Desktop with PyQt6 main UI and installer fallback.
-
-- On start, tries to import PyQt6.
-- If available: runs the full PyQt6 desktop app (Chat + Backend tabs).
-- If not available:
-    * Tries to show a minimal Tkinter installer UI that pip-installs PyQt6
-      and streams progress.
-    * If Tkinter is not available either, falls back to a simple curses TUI
-      to install PyQt6.
-"""
-
 from __future__ import annotations
 
 import sys
 import subprocess
 import threading
 import queue
-import platform
-from pathlib import Path
 from typing import Optional
 
 from codex_clone.config import load_config, Config
 from codex_clone.api import send_chat, CodexError
 
 
-# ---------------------------------------------------------------------------
-# Shared backend manager (helper process) and chat client
-# ---------------------------------------------------------------------------
-
-
 class BackendManager:
-    """Backend manager using a *separate helper process*.
-
-    All heavy work lives in `python -m codex_clone.backend_helper`.
-    We only stream its stdout into a queue; the UI layer pulls
-    from that queue and updates widgets.
-    """
-
     def __init__(self, log_queue: "queue.Queue[str]") -> None:
         self._log_queue = log_queue
         self._proc: Optional[subprocess.Popen] = None
@@ -50,7 +25,6 @@ class BackendManager:
             return self._proc.poll() is None
 
     def start(self) -> None:
-        """Start helper process in a non-blocking way."""
         with self._lock:
             if self.is_running:
                 self._log_queue.put("[gui] Backend already running.")
@@ -58,11 +32,7 @@ class BackendManager:
             if self._reader_thread and self._reader_thread.is_alive():
                 self._log_queue.put("[gui] Backend startup already in progress.")
                 return
-            cmd = [
-                sys.executable,
-                "-m",
-                "codex_clone.backend_helper",
-            ]
+            cmd = [sys.executable, "-m", "codex_clone.backend_helper"]
             try:
                 proc = subprocess.Popen(
                     cmd,
@@ -83,7 +53,6 @@ class BackendManager:
             self._log_queue.put("[gui] Backend helper process started.")
 
     def _reader_worker(self) -> None:
-        proc: Optional[subprocess.Popen]
         with self._lock:
             proc = self._proc
         if proc is None or proc.stdout is None:
@@ -104,14 +73,10 @@ class BackendManager:
 
 
 class ChatClient:
-    """Background chat client that posts results into queues."""
-
     def __init__(self, config: Config, log_queue: "queue.Queue[str]") -> None:
         self._config = config
         self._log_queue = log_queue
-        self._messages = [
-            {"role": "system", "content": self._config.system_prompt},
-        ]
+        self._messages = [{"role": "system", "content": self._config.system_prompt}]
         self._lock = threading.Lock()
 
     @property
@@ -127,11 +92,6 @@ class ChatClient:
         user_text: str,
         reply_queue: "queue.Queue[tuple[str, str]]",
     ) -> None:
-        """Send chat in a worker thread, push (kind, text) into reply_queue.
-
-        kind is either "reply" or "error".
-        """
-
         def worker() -> None:
             try:
                 with self._lock:
@@ -149,14 +109,8 @@ class ChatClient:
         threading.Thread(target=worker, daemon=True).start()
 
 
-# ---------------------------------------------------------------------------
-# PyQt6 main UI
-# ---------------------------------------------------------------------------
-
-
 def run_pyqt_app() -> int:
-    """Run the main PyQt6 desktop application."""
-    from PyQt6 import QtWidgets, QtCore
+    from PyQt6 import QtWidgets, QtCore, QtGui
 
     class MainWindow(QtWidgets.QMainWindow):
         def __init__(self) -> None:
@@ -164,19 +118,15 @@ def run_pyqt_app() -> int:
             self.setWindowTitle("Codex Portable Desktop (PyQt6)")
             self.resize(1000, 650)
 
-            # Queues
             self.backend_log_queue: "queue.Queue[str]" = queue.Queue()
             self.chat_queue: "queue.Queue[tuple[str, str]]" = queue.Queue()
 
-            # Core helpers
             self.config: Config = load_config()
             self.backend_manager = BackendManager(self.backend_log_queue)
             self.chat_client = ChatClient(self.config, self.backend_log_queue)
 
-            # Build UI
             self._build_ui()
 
-            # Timers to drain queues
             self._backend_timer = QtCore.QTimer(self)
             self._backend_timer.timeout.connect(self._drain_backend_log)
             self._backend_timer.start(100)
@@ -185,23 +135,18 @@ def run_pyqt_app() -> int:
             self._chat_timer.timeout.connect(self._drain_chat_queue)
             self._chat_timer.start(80)
 
-            # Timer to poll backend status
             self._status_timer = QtCore.QTimer(self)
             self._status_timer.timeout.connect(self._poll_backend_status)
             self._status_timer.start(1000)
-
-        # --- UI construction ---
 
         def _build_ui(self) -> None:
             tabs = QtWidgets.QTabWidget()
             self.setCentralWidget(tabs)
 
-            # Chat tab
             chat_tab = QtWidgets.QWidget()
             tabs.addTab(chat_tab, "Chat")
             self._build_chat_tab(chat_tab)
 
-            # Backend tab
             backend_tab = QtWidgets.QWidget()
             tabs.addTab(backend_tab, "AI Backend")
             self._build_backend_tab(backend_tab)
@@ -231,11 +176,10 @@ def run_pyqt_app() -> int:
             self.send_button.clicked.connect(self._on_send)
             bottom.addWidget(self.send_button)
 
-            # Shortcut: Ctrl+Enter
-            send_shortcut = QtWidgets.QShortcut(
+            shortcut = QtWidgets.QShortcut(
                 QtGui.QKeySequence("Ctrl+Return"), parent
             )
-            send_shortcut.activated.connect(self._on_send)
+            shortcut.activated.connect(self._on_send)
 
         def _build_backend_tab(self, parent: QtWidgets.QWidget) -> None:
             layout = QtWidgets.QVBoxLayout(parent)
@@ -294,8 +238,6 @@ def run_pyqt_app() -> int:
             )
             layout.addWidget(self.backend_log, stretch=1)
 
-        # --- Backend logging / chat queue draining ---
-
         def _drain_backend_log(self) -> None:
             while True:
                 try:
@@ -331,9 +273,6 @@ def run_pyqt_app() -> int:
             else:
                 self.status_label.setText("Backend: not running")
 
-
-        # --- UI callbacks ---
-
         def _on_send(self) -> None:
             user = self.prompt.toPlainText().strip()
             if not user:
@@ -366,24 +305,16 @@ def run_pyqt_app() -> int:
             self.chat_client.update_config(new_cfg)
             self.backend_log.appendPlainText("[gui] Settings applied to chat client.")
 
-    # PyQt requires QtGui for shortcut keys
-    from PyQt6 import QtGui
-
     app = QtWidgets.QApplication(sys.argv)
     w = MainWindow()
     w.show()
     return app.exec()
 
 
-# ---------------------------------------------------------------------------
-# Tkinter installer UI (if PyQt6 missing)
-# ---------------------------------------------------------------------------
-
-
 def run_tk_installer() -> int:
     try:
         import tkinter as tk
-        from tkinter import scrolledtext, messagebox
+        from tkinter import scrolledtext
     except Exception:
         return run_curses_installer()
 
@@ -412,7 +343,7 @@ def run_tk_installer() -> int:
             log_queue.put("PyQt6 install failed. See output above.")
 
     root = tk.Tk()
-    root.title("Codex Portable - PyQt6 Installer (Tkinter)")
+    root.title("Codex Portable - PyQt6 Auto-Installer (Tkinter)")
     root.geometry("700x400")
 
     text = scrolledtext.ScrolledText(root, wrap=tk.WORD)
@@ -420,15 +351,10 @@ def run_tk_installer() -> int:
     text.insert(
         tk.END,
         "PyQt6 is not installed.\n\n"
-        "Click 'Install PyQt6' to install it into this Python environment.\n"
+        "An automatic install has been started using pip.\n"
         "Progress will appear here.\n\n",
     )
     text.config(state=tk.DISABLED)
-
-    frame = tk.Frame(root)
-    frame.pack(fill=tk.X, padx=6, pady=6)
-
-    installing = tk.BooleanVar(value=False)
 
     def append_log(line: str) -> None:
         text.config(state=tk.NORMAL)
@@ -445,51 +371,25 @@ def run_tk_installer() -> int:
             append_log(line)
         root.after(100, poll_queue)
 
-    def on_install() -> None:
-        if installing.get():
-            return
-        installing.set(True)
-        btn.config(state=tk.DISABLED)
-        threading.Thread(target=installer_thread, daemon=True).start()
-
-    btn = tk.Button(frame, text="Install PyQt6", command=on_install)
-    btn.pack(side=tk.LEFT)
-
-    close_btn = tk.Button(frame, text="Close", command=root.destroy)
-    close_btn.pack(side=tk.RIGHT)
+    # Auto-start installer thread without user clicking anything
+    threading.Thread(target=installer_thread, daemon=True).start()
 
     poll_queue()
     root.mainloop()
     return 0
 
 
-# ---------------------------------------------------------------------------
-# Curses installer fallback
-# ---------------------------------------------------------------------------
-
-
 def run_curses_installer() -> int:
     try:
         import curses  # type: ignore[unused-ignore]
     except Exception:
-        # Last resort: run pip in this terminal.
         cmd = [sys.executable, "-m", "pip", "install", "PyQt6"]
         return subprocess.call(cmd)
 
     def _main(stdscr: "curses._CursesWindow") -> int:  # type: ignore[name-defined]
         curses.curs_set(0)
         stdscr.clear()
-        stdscr.addstr(0, 0, "PyQt6 is not installed.")
-        stdscr.addstr(1, 0, "Press 'i' to install PyQt6, 'q' to quit.")
-        stdscr.refresh()
-        while True:
-            ch = stdscr.getch()
-            if ch in (ord("q"), ord("Q")):
-                return 0
-            if ch in (ord("i"), ord("I")):
-                break
-        stdscr.clear()
-        stdscr.addstr(0, 0, "Installing PyQt6... (output will appear below)")
+        stdscr.addstr(0, 0, "PyQt6 is not installed. Installing automatically...")
         stdscr.refresh()
         cmd = [sys.executable, "-m", "pip", "install", "PyQt6"]
         proc = subprocess.Popen(
@@ -517,18 +417,11 @@ def run_curses_installer() -> int:
     return curses.wrapper(_main)
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-
 def main() -> int:
     try:
         import PyQt6  # noqa: F401
     except Exception:
-        # No PyQt6; run installer flows
         return run_tk_installer()
-    # If we got here, PyQt6 import works; launch the main UI.
     return run_pyqt_app()
 
 

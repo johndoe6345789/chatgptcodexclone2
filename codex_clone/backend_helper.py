@@ -1,10 +1,3 @@
-"""Helper process for managing model + llama_cpp.server.
-
-This script is spawned by the GUI in a *separate process*.
-It does all heavy work (huggingface, pip, llama server) and
-prints log lines that are streamed back into the GUI.
-"""
-
 from __future__ import annotations
 
 import subprocess

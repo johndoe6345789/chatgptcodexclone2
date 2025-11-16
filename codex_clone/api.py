@@ -1,5 +1,3 @@
-"""HTTP client for talking to an OpenAI-compatible server."""
-
 from __future__ import annotations
 
 from typing import Iterable, List, Dict
@@ -12,14 +10,13 @@ from .config import Config
 
 
 class CodexError(RuntimeError):
-    """Raised when the Codex clone encounters an HTTP error."""
+    pass
 
 
 def _build_payload(
     messages: Iterable[Dict[str, str]],
     config: Config,
 ) -> bytes:
-    """Build a JSON payload for the chat.completions endpoint."""
     payload = {
         "model": config.model,
         "messages": list(messages),
@@ -34,7 +31,6 @@ def _build_request(
     payload: bytes,
     config: Config,
 ) -> urllib.request.Request:
-    """Create an HTTP request for the local server."""
     url = config.base_url.rstrip("/") + "/v1/chat/completions"
     request = urllib.request.Request(url, data=payload)
     request.add_header("Content-Type", "application/json")
@@ -44,7 +40,6 @@ def _build_request(
 
 
 def _parse_response(data: bytes) -> str:
-    """Extract assistant text from the JSON response."""
     try:
         obj = json.loads(data.decode("utf-8"))
     except json.JSONDecodeError as exc:
@@ -63,7 +58,6 @@ def send_chat(
     messages: List[Dict[str, str]],
     config: Config,
 ) -> str:
-    """Send a chat completion request and return the reply text."""
     payload = _build_payload(messages, config)
     request = _build_request(payload, config)
     try:
