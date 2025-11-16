@@ -329,15 +329,21 @@ def run_pyqt_app() -> int:
             self.setWindowTitle("Codex Portable Desktop (Socket Backend, Clean)")
             self.resize(1000, 650)
 
+            # Queues used by the socket client to feed data back to the UI.
             self.backend_log_queue: "queue.Queue[str]" = queue.Queue()
             self.chat_queue: "queue.Queue[Tuple[str, str]]" = queue.Queue()
 
+            # Config + socket backend client.
             self.config: Config = load_config()
             self.socket_client = SocketBackendClient(
                 self.backend_log_queue, self.chat_queue
             )
             self.socket_client.ensure_connected_async()
 
+            # Status bar like a code editor: services + backend + last log line.
+            self._init_status_bar()
+
+            # Build tabs and timers.
             self._build_ui()
 
             self._backend_timer = QtCore.QTimer(self)
@@ -351,6 +357,23 @@ def run_pyqt_app() -> int:
             self._status_timer = QtCore.QTimer(self)
             self._status_timer.timeout.connect(self._poll_backend_status)
             self._status_timer.start(1000)
+
+        def _init_status_bar(self) -> None:
+            from PyQt6 import QtWidgets as QtW
+
+            bar = self.statusBar()
+            bar.setSizeGripEnabled(False)
+
+            self.sb_services = QtW.QLabel("Daemon: starting...")
+            self.sb_backend = QtW.QLabel("Backend: idle")
+            self.sb_lastlog = QtW.QLabel("Last log: (none)")
+
+            for lbl in (self.sb_services, self.sb_backend, self.sb_lastlog):
+                lbl.setStyleSheet("color: #9ca3af; padding: 0 8px;")
+
+            bar.addPermanentWidget(self.sb_services)
+            bar.addPermanentWidget(self.sb_backend, 1)
+            bar.addPermanentWidget(self.sb_lastlog, 3)
 
         def _build_ui(self) -> None:
             tabs = QtWidgets.QTabWidget()
@@ -403,11 +426,21 @@ def run_pyqt_app() -> int:
             outer.setContentsMargins(12, 12, 12, 12)
             outer.setSpacing(10)
 
-            self.status_label = QtWidgets.QLabel("Backend: unknown")
+            self.status_label = QtWidgets.QLabel("Backend: idle")
             font = self.status_label.font()
             font.setBold(True)
             self.status_label.setFont(font)
             outer.addWidget(self.status_label)
+
+            # Progress/feedback widget.
+            from PyQt6 import QtWidgets as QtW
+            self.backend_progress = QtW.QProgressBar()
+            self.backend_progress.setMinimum(0)
+            self.backend_progress.setMaximum(1)
+            self.backend_progress.setValue(0)
+            self.backend_progress.setTextVisible(True)
+            self.backend_progress.setFormat("Idle")
+            outer.addWidget(self.backend_progress)
 
             button_row = QtWidgets.QHBoxLayout()
             button_row.setSpacing(8)
@@ -439,9 +472,77 @@ def run_pyqt_app() -> int:
                 except queue.Empty:
                     break
                 self.backend_log.appendPlainText(line)
+                # Update backend progress + status bar last-log entry.
+                self._update_backend_progress_from_log(line)
+                self.sb_lastlog.setText(f"Last log: {line.strip()}")
                 self.backend_log.verticalScrollBar().setValue(
                     self.backend_log.verticalScrollBar().maximum()
                 )
+
+        def _update_backend_progress_from_log(self, line: str) -> None:
+            text = line.strip()
+
+            if "[gui] Start Local Backend clicked" in text:
+                self.backend_progress.setRange(0, 0)
+                self.backend_progress.setFormat("Starting backend...")
+                self.status_label.setText("Backend: starting (launching helper)")
+                self.sb_backend.setText("Backend: starting")
+            elif "[daemon] backend_helper launched." in text:
+                self.backend_progress.setRange(0, 0)
+                self.backend_progress.setFormat("Backend helper launched, waiting for server...")
+                self.status_label.setText("Backend: helper running (starting server)")
+                self.sb_backend.setText("Backend: helper running")
+            elif "[helper] Downloading model from Hugging Face" in text:
+                self.backend_progress.setRange(0, 0)
+                self.backend_progress.setFormat("Downloading model (first run may take a while)...")
+                self.status_label.setText("Backend: downloading model")
+                self.sb_backend.setText("Backend: downloading model")
+            elif "[helper] Model already present" in text:
+                self.backend_progress.setRange(0, 0)
+                self.backend_progress.setFormat("Model present, starting server...")
+                self.status_label.setText("Backend: starting server")
+                self.sb_backend.setText("Backend: starting server")
+            elif "[helper] Installing huggingface_hub" in text or "Installing llama-cpp-python" in text:
+                self.backend_progress.setRange(0, 0)
+                self.backend_progress.setFormat("Installing backend dependencies...")
+                self.status_label.setText("Backend: installing dependencies")
+                self.sb_backend.setText("Backend: installing deps")
+            elif "[llama] " in text and "HTTP server listening" in text:
+                self.backend_progress.setRange(0, 1)
+                self.backend_progress.setValue(1)
+                self.backend_progress.setFormat("Backend running")
+                self.status_label.setText("Backend: running")
+                self.sb_backend.setText("Backend: running")
+            elif "backend_helper exited with code" in text:
+                self.backend_progress.setRange(0, 1)
+                self.backend_progress.setValue(0)
+                self.backend_progress.setFormat("Backend stopped")
+                self.status_label.setText("Backend: stopped")
+                self.sb_backend.setText("Backend: stopped")
+            elif "Backend helper is not running" in text:
+                self.backend_progress.setRange(0, 1)
+                self.backend_progress.setValue(0)
+                self.backend_progress.setFormat("Idle")
+                self.status_label.setText("Backend: idle (helper not running)")
+                self.sb_backend.setText("Backend: idle")
+            elif "ERROR" in text or "error" in text:
+                self.backend_progress.setRange(0, 1)
+                self.backend_progress.setValue(0)
+                self.backend_progress.setFormat("Error")
+                self.status_label.setText("Backend: error (see log)")
+                self.sb_backend.setText("Backend: error")
+
+            # Update services label for daemon/connection hints.
+            if "Socket backend starting on" in text:
+                self.sb_services.setText("Daemon: starting")
+            elif "Socket backend listening" in text:
+                self.sb_services.setText("Daemon: listening")
+            elif "Socket backend exiting serve_forever" in text:
+                self.sb_services.setText("Daemon: stopped")
+            elif "[gui] Connected to socket backend." in text:
+                self.sb_services.setText("Daemon: connected")
+            elif "[gui] Disconnected from socket backend." in text:
+                self.sb_services.setText("Daemon: disconnected")
 
         def _drain_chat_queue(self) -> None:
             while True:
@@ -468,8 +569,10 @@ def run_pyqt_app() -> int:
                 self.status_label.setText(
                     "Backend: socket daemon connected (see log)"
                 )
+                self.sb_services.setText("Daemon: connected")
             else:
                 self.status_label.setText("Backend: not connected (auto-reconnect)")
+                self.sb_services.setText("Daemon: reconnecting...")
                 if self.socket_client._ever_connected:
                     self.socket_client.ensure_connected_async()
 
