@@ -7,6 +7,7 @@ import urllib.request
 import urllib.error
 
 from .config import Config
+from .logging_utils import log_line
 
 
 class CodexError(RuntimeError):
@@ -60,9 +61,13 @@ def send_chat(
 ) -> str:
     payload = _build_payload(messages, config)
     request = _build_request(payload, config)
+    log_line("HTTP chat request to local backend")
     try:
         with urllib.request.urlopen(request, timeout=600) as response:
             body = response.read()
     except urllib.error.URLError as exc:
+        log_line(f"HTTP error: {exc}")
         raise CodexError(str(exc)) from exc
-    return _parse_response(body)
+    reply = _parse_response(body)
+    log_line("HTTP chat reply received")
+    return reply

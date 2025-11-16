@@ -1,122 +1,200 @@
 from __future__ import annotations
 
 import sys
-import subprocess
+import json
+import socket
 import threading
 import queue
+import subprocess
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any, Tuple
 
 from codex_clone.config import load_config, Config
-from codex_clone.api import send_chat, CodexError
+from codex_clone.logging_utils import log_line
 
 
-class BackendManager:
-    """Helper-process backend manager with log queue."""
-
-    def __init__(self, log_queue: "queue.Queue[str]") -> None:
-        self._log_queue = log_queue
-        self._proc: Optional[subprocess.Popen] = None
-        self._lock = threading.Lock()
-        self._reader_thread: Optional[threading.Thread] = None
-
-    @property
-    def is_running(self) -> bool:
-        with self._lock:
-            if self._proc is None:
-                return False
-            return self._proc.poll() is None
-
-    def start(self) -> None:
-        with self._lock:
-            if self.is_running:
-                self._log_queue.put("[gui] Backend already running.")
-                return
-            if self._reader_thread and self._reader_thread.is_alive():
-                self._log_queue.put("[gui] Backend startup already in progress.")
-                return
-            cmd = [sys.executable, "-m", "codex_clone.backend_helper"]
-            try:
-                proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                )
-            except Exception as exc:
-                self._log_queue.put(f"[gui] ERROR: Could not start backend helper: {exc}")
-                return
-            self._proc = proc
-            self._reader_thread = threading.Thread(
-                target=self._reader_worker,
-                name="backend-helper-reader",
-                daemon=True,
-            )
-            self._reader_thread.start()
-            self._log_queue.put("[gui] Backend helper process started.")
-
-    def _reader_worker(self) -> None:
-        with self._lock:
-            proc = self._proc
-        if proc is None or proc.stdout is None:
-            return
-        for line in proc.stdout:
-            self._log_queue.put(line.rstrip())
-        code = proc.wait()
-        self._log_queue.put(f"[gui] Backend helper exited with code {code}.")
-
-    def stop(self) -> None:
-        with self._lock:
-            if not self.is_running:
-                self._log_queue.put("[gui] No backend process to stop.")
-                return
-            assert self._proc is not None
-            self._log_queue.put("[gui] Terminating backend helper...")
-            self._proc.terminate()
+HOST = "127.0.0.1"
+PORT = 56789
 
 
-class ChatClient:
-    """Background chat client using queues."""
+class SocketBackendClient:
+    """JSON-over-TCP client for the socket backend."""
 
-    def __init__(self, config: Config, log_queue: "queue.Queue[str]") -> None:
-        self._config = config
-        self._log_queue = log_queue
-        self._messages = [
-            {"role": "system", "content": self._config.system_prompt},
-        ]
-        self._lock = threading.Lock()
-
-    @property
-    def config(self) -> Config:
-        return self._config
-
-    def update_config(self, config: Config) -> None:
-        with self._lock:
-            self._config = config
-
-    def send_async(
+    def __init__(
         self,
-        user_text: str,
-        reply_queue: "queue.Queue[tuple[str, str]]",
+        backend_log_queue: "queue.Queue[str]",
+        chat_queue: "queue.Queue[Tuple[str, str]]",
     ) -> None:
+        self._backend_log_queue = backend_log_queue
+        self._chat_queue = chat_queue
+        self._sock: Optional[socket.socket] = None
+        self._writer: Optional[Any] = None
+        self._reader_thread: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
+        self._connected = False
+        self._req_counter = 0
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected
+
+    def ensure_connected_async(self) -> None:
         def worker() -> None:
-            try:
-                with self._lock:
-                    self._messages.append({"role": "user", "content": user_text})
-                    reply = send_chat(self._messages, self._config)
-                    self._messages.append({"role": "assistant", "content": reply})
-                reply_queue.put(("reply", reply))
-            except CodexError as error:
-                self._log_queue.put(f"[error] {error}")
-                reply_queue.put(("error", str(error)))
-            except Exception as exc:
-                self._log_queue.put(f"[error] Unexpected: {exc}")
-                reply_queue.put(("error", str(exc)))
+            if self._connected:
+                return
+            if not self._try_connect():
+                self._start_daemon()
+                if not self._try_connect():
+                    msg = "[gui] Could not connect to socket backend."
+                    self._backend_log_queue.put(msg)
+                    log_line(msg)
+                    return
+            msg = "[gui] Connected to socket backend."
+            self._backend_log_queue.put(msg)
+            log_line(msg)
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _try_connect(self) -> bool:
+        try:
+            sock = socket.create_connection((HOST, PORT), timeout=2.0)
+        except OSError as exc:
+            log_line(f"[gui] socket connect failed: {exc}")
+            return False
+        f_out = sock.makefile("w", encoding="utf-8")
+        with self._lock:
+            self._sock = sock
+            self._writer = f_out
+            self._connected = True
+        self._reader_thread = threading.Thread(
+            target=self._reader_worker, name="socket-backend-reader", daemon=True
+        )
+        self._reader_thread.start()
+        return True
 
-# ---------------------- PyQt6 modern desktop UI ---------------------------
+    def _start_daemon(self) -> None:
+        try:
+            subprocess.Popen(
+                [sys.executable, "-m", "codex_clone.socket_backend"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            log_line("[gui] Launched socket backend daemon process")
+        except Exception as exc:
+            msg = f"[gui] ERROR: failed to start socket backend daemon: {exc}"
+            self._backend_log_queue.put(msg)
+            log_line(msg)
+
+    def _reader_worker(self) -> None:
+        with self._lock:
+            sock = self._sock
+        if sock is None:
+            return
+        f_in = sock.makefile("r", encoding="utf-8")
+        try:
+            for line in f_in:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                self._handle_message(msg)
+        finally:
+            with self._lock:
+                self._connected = False
+            msg = "[gui] Disconnected from socket backend."
+            self._backend_log_queue.put(msg)
+            log_line(msg)
+
+    def _handle_message(self, msg: Dict[str, Any]) -> None:
+        mtype = msg.get("type")
+        if mtype == "backend_log":
+            text = str(msg.get("message", ""))
+            self._backend_log_queue.put(text)
+            log_line(text)
+        elif mtype == "chat_reply":
+            ok = bool(msg.get("ok", False))
+            content = str(msg.get("content", ""))
+            error = str(msg.get("error", ""))
+            if ok:
+                self._chat_queue.put(("reply", content))
+                log_line("[gui] chat_reply ok")
+            else:
+                self._chat_queue.put(("error", error or "Chat request failed."))
+                log_line(f"[gui] chat_reply error: {error}")
+        elif mtype == "hello":
+            text = str(msg.get("message", ""))
+            line = f"[daemon] {text}"
+            self._backend_log_queue.put(line)
+            log_line(line)
+        elif mtype == "status":
+            running = bool(msg.get("running", False))
+            if running:
+                line = "[daemon] Backend helper is running."
+            else:
+                line = "[daemon] Backend helper is not running."
+            self._backend_log_queue.put(line)
+            log_line(line)
+        elif mtype == "shutdown_ack":
+            line = "[daemon] Shutdown acknowledged."
+            self._backend_log_queue.put(line)
+            log_line(line)
+
+    def send_start_backend(self) -> None:
+        self._send_async({"type": "start_backend"})
+
+    def send_stop_backend(self) -> None:
+        self._send_async({"type": "stop_backend"})
+
+    def send_status(self) -> None:
+        self._send_async({"type": "status"})
+
+    def send_chat(self, messages: list[dict[str, str]]) -> None:
+        req_id = self._next_req_id()
+        payload = {"type": "chat", "id": req_id, "messages": messages}
+        self._send_async(payload)
+
+    def send_shutdown(self) -> None:
+        with self._lock:
+            if not self._connected or self._writer is None:
+                return
+            try:
+                text = json.dumps({"type": "shutdown"}, ensure_ascii=False)
+                self._writer.write(text + "\n")
+                self._writer.flush()
+            except OSError:
+                pass
+            try:
+                if self._sock is not None:
+                    self._sock.close()
+            except OSError:
+                pass
+            self._connected = False
+
+    def _next_req_id(self) -> str:
+        self._req_counter += 1
+        return f"req-{self._req_counter}"
+
+    def _send_async(self, obj: Dict[str, Any]) -> None:
+        def worker() -> None:
+            with self._lock:
+                if not self._connected or self._writer is None:
+                    msg = "[gui] Cannot send, socket backend not connected."
+                    self._backend_log_queue.put(msg)
+                    log_line(msg)
+                    return
+                try:
+                    text = json.dumps(obj, ensure_ascii=False)
+                    self._writer.write(text + "\n")
+                    self._writer.flush()
+                except OSError as exc:
+                    msg = f"[gui] Send failed: {exc}"
+                    self._backend_log_queue.put(msg)
+                    log_line(msg)
+
+        threading.Thread(target=worker, daemon=True).start()
 
 
 def _apply_modern_style(app: "QtWidgets.QApplication") -> None:  # type: ignore[name-defined]
@@ -137,73 +215,70 @@ def _apply_modern_style(app: "QtWidgets.QApplication") -> None:  # type: ignore[
     dark.setColor(QtGui.QPalette.ColorRole.HighlightedText, QtGui.QColor("#f9fafb"))
     app.setPalette(dark)
 
-    # Discord-ish styling
     app.setStyleSheet(
-        """
-        QMainWindow {
-            background-color: #0f172a;
-        }
-        QTabWidget::pane {
-            border-top: 1px solid #111827;
-            background: #020617;
-        }
-        QTabBar::tab {
-            background: #020617;
-            color: #9ca3af;
-            padding: 6px 14px;
-            border-radius: 6px 6px 0 0;
-            margin-right: 2px;
-        }
-        QTabBar::tab:selected {
-            background: #111827;
-            color: #e5e7eb;
-        }
-        QPlainTextEdit, QTextEdit {
-            background-color: #020617;
-            color: #e5e7eb;
-            border: 1px solid #1f2937;
-            border-radius: 8px;
-            padding: 6px;
-        }
-        QLineEdit, QSpinBox {
-            background-color: #020617;
-            color: #e5e7eb;
-            border: 1px solid #1f2937;
-            border-radius: 6px;
-            padding: 4px 6px;
-            selection-background-color: #3b82f6;
-        }
-        QLabel {
-            color: #9ca3af;
-        }
-        QPushButton {
-            background-color: #111827;
-            color: #e5e7eb;
-            border-radius: 8px;
-            padding: 6px 14px;
-            border: 1px solid #1f2937;
-        }
-        QPushButton:hover {
-            background-color: #1f2937;
-        }
-        QPushButton:pressed {
-            background-color: #020617;
-        }
-        QPushButton#primaryButton {
-            background-color: #5865F2;
-            border: none;
-        }
-        QPushButton#primaryButton:hover {
-            background-color: #4f5ee8;
-        }
-        QPushButton#primaryButton:pressed {
-            background-color: #4b56cf;
-        }
-        """
+        "QMainWindow {"
+        "background-color: #0f172a;"
+        "}"
+        "QTabWidget::pane {"
+        "border-top: 1px solid #111827;"
+        "background: #020617;"
+        "}"
+        "QTabBar::tab {"
+        "background: #020617;"
+        "color: #9ca3af;"
+        "padding: 6px 14px;"
+        "border-radius: 6px 6px 0 0;"
+        "margin-right: 2px;"
+        "}"
+        "QTabBar::tab:selected {"
+        "background: #111827;"
+        "color: #e5e7eb;"
+        "}"
+        "QPlainTextEdit, QTextEdit {"
+        "background-color: #020617;"
+        "color: #e5e7eb;"
+        "border: 1px solid #1f2937;"
+        "border-radius: 8px;"
+        "padding: 6px;"
+        "}"
+        "QLineEdit, QSpinBox {"
+        "background-color: #020617;"
+        "color: #e5e7eb;"
+        "border: 1px solid #1f2937;"
+        "border-radius: 6px;"
+        "padding: 4px 6px;"
+        "selection-background-color: #3b82f6;"
+        "}"
+        "QLabel {"
+        "color: #9ca3af;"
+        "}"
+        "QPushButton {"
+        "background-color: #111827;"
+        "color: #e5e7eb;"
+        "border-radius: 8px;"
+        "padding: 6px 14px;"
+        "border: 1px solid #1f2937;"
+        "}"
+        "QPushButton:hover {"
+        "background-color: #1f2937;"
+        "}"
+        "QPushButton:pressed {"
+        "background-color: #020617;"
+        "}"
+        "QPushButton#primaryButton {"
+        "background-color: #5865F2;"
+        "border: none;"
+        "}"
+        "QPushButton#primaryButton:hover {"
+        "background-color: #4f5ee8;"
+        "}"
+        "QPushButton#primaryButton:pressed {"
+        "background-color: #4b56cf;"
+        "}"
     )
 
 
-def _load_app_icon() -> "Optional[object]":  # QIcon, but avoid importing in sig
+def _load_app_icon() -> "Optional[object]":
     from PyQt6 import QtGui
 
     icon_path = Path(__file__).with_name("icon.svg")
@@ -221,15 +296,17 @@ def run_pyqt_app() -> int:
     class MainWindow(QtWidgets.QMainWindow):
         def __init__(self) -> None:
             super().__init__()
-            self.setWindowTitle("Codex Portable Desktop")
+            self.setWindowTitle("Codex Portable Desktop (Socket Backend, Clean)")
             self.resize(1000, 650)
 
             self.backend_log_queue: "queue.Queue[str]" = queue.Queue()
-            self.chat_queue: "queue.Queue[tuple[str, str]]" = queue.Queue()
+            self.chat_queue: "queue.Queue[Tuple[str, str]]" = queue.Queue()
 
             self.config: Config = load_config()
-            self.backend_manager = BackendManager(self.backend_log_queue)
-            self.chat_client = ChatClient(self.config, self.backend_log_queue)
+            self.socket_client = SocketBackendClient(
+                self.backend_log_queue, self.chat_queue
+            )
+            self.socket_client.ensure_connected_async()
 
             self._build_ui()
 
@@ -265,8 +342,8 @@ def run_pyqt_app() -> int:
             self.convo = QtWidgets.QPlainTextEdit()
             self.convo.setReadOnly(True)
             self.convo.appendPlainText(
-                "Codex Portable Desktop (PyQt6)\n"
-                "Use the AI Backend tab to start a local server or point to LM Studio.\n"
+                "Codex Portable Desktop (Socket Backend)\n"
+                "The backend daemon handles HTTP + model server; this UI just renders.\n"
             )
             layout.addWidget(self.convo, stretch=1)
 
@@ -275,7 +352,9 @@ def run_pyqt_app() -> int:
             layout.addLayout(bottom)
 
             self.prompt = QtWidgets.QTextEdit()
-            self.prompt.setPlaceholderText("Ask for code, refactors, or explanations...")
+            self.prompt.setPlaceholderText(
+                "Ask for code, refactors, or explanations..."
+            )
             self.prompt.setFixedHeight(90)
             bottom.addWidget(self.prompt, stretch=1)
 
@@ -294,38 +373,11 @@ def run_pyqt_app() -> int:
             outer.setContentsMargins(12, 12, 12, 12)
             outer.setSpacing(10)
 
-            form = QtWidgets.QGridLayout()
-            form.setHorizontalSpacing(10)
-            form.setVerticalSpacing(8)
-            outer.addLayout(form)
-
             self.status_label = QtWidgets.QLabel("Backend: unknown")
             font = self.status_label.font()
             font.setBold(True)
             self.status_label.setFont(font)
-            form.addWidget(self.status_label, 0, 0, 1, 2)
-
-            form.addWidget(QtWidgets.QLabel("Base URL:"), 1, 0)
-            self.base_url_edit = QtWidgets.QLineEdit(self.config.base_url)
-            form.addWidget(self.base_url_edit, 1, 1)
-
-            form.addWidget(QtWidgets.QLabel("Model name:"), 2, 0)
-            self.model_edit = QtWidgets.QLineEdit(self.config.model)
-            form.addWidget(self.model_edit, 2, 1)
-
-            form.addWidget(QtWidgets.QLabel("Temperature:"), 3, 0)
-            self.temp_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-            self.temp_slider.setMinimum(0)
-            self.temp_slider.setMaximum(100)
-            self.temp_slider.setValue(int(self.config.temperature * 100))
-            form.addWidget(self.temp_slider, 3, 1)
-
-            form.addWidget(QtWidgets.QLabel("Max tokens:"), 4, 0)
-            self.max_tokens_spin = QtWidgets.QSpinBox()
-            self.max_tokens_spin.setMinimum(128)
-            self.max_tokens_spin.setMaximum(32768)
-            self.max_tokens_spin.setValue(self.config.max_tokens)
-            form.addWidget(self.max_tokens_spin, 4, 1)
+            outer.addWidget(self.status_label)
 
             button_row = QtWidgets.QHBoxLayout()
             button_row.setSpacing(8)
@@ -340,9 +392,10 @@ def run_pyqt_app() -> int:
             self.stop_button.clicked.connect(self._on_stop_backend)
             button_row.addWidget(self.stop_button)
 
-            self.apply_button = QtWidgets.QPushButton("Apply Settings")
-            self.apply_button.clicked.connect(self._on_apply_settings)
-            button_row.addWidget(self.apply_button)
+            self.status_button = QtWidgets.QPushButton("Check Status")
+            self.status_button.clicked.connect(self._on_check_status)
+            button_row.addWidget(self.status_button)
+
             button_row.addStretch(1)
 
             self.backend_log = QtWidgets.QPlainTextEdit()
@@ -378,11 +431,12 @@ def run_pyqt_app() -> int:
             )
 
         def _poll_backend_status(self) -> None:
-            if self.backend_manager.is_running:
-                self.status_label.setText("Backend: helper running (see log)")
+            if self.socket_client.is_connected:
+                self.status_label.setText(
+                    "Backend: socket daemon connected (see log)"
+                )
             else:
-                self.status_label.setText("Backend: not running")
-
+                self.status_label.setText("Backend: not connected")
 
         def _on_send(self) -> None:
             user = self.prompt.toPlainText().strip()
@@ -391,30 +445,33 @@ def run_pyqt_app() -> int:
             self.prompt.clear()
             self.convo.appendPlainText("you> " + user)
             self.send_button.setEnabled(False)
-            self.chat_client.send_async(user, self.chat_queue)
+            messages = [
+                {"role": "system", "content": self.config.system_prompt},
+                {"role": "user", "content": user},
+            ]
+            log_line("[gui] sending chat via socket backend")
+            self.socket_client.send_chat(messages)
 
         def _on_start_backend(self) -> None:
-            self.backend_manager.start()
+            log_line("[gui] Start Local Backend clicked")
+            self.socket_client.ensure_connected_async()
+            self.socket_client.send_start_backend()
 
         def _on_stop_backend(self) -> None:
-            self.backend_manager.stop()
+            log_line("[gui] Stop Backend clicked")
+            self.socket_client.send_stop_backend()
 
-        def _on_apply_settings(self) -> None:
-            temp = self.temp_slider.value() / 100.0
-            max_tokens = int(self.max_tokens_spin.value())
-            base_url = self.base_url_edit.text().strip() or self.config.base_url
-            model = self.model_edit.text().strip() or self.config.model
-            new_cfg = Config(
-                base_url=base_url,
-                api_key=self.config.api_key,
-                model=model,
-                system_prompt=self.config.system_prompt,
-                temperature=temp,
-                max_tokens=max_tokens,
-            )
-            self.config = new_cfg
-            self.chat_client.update_config(new_cfg)
-            self.backend_log.appendPlainText("[gui] Settings applied to chat client.")
+        def _on_check_status(self) -> None:
+            log_line("[gui] Check Status clicked")
+            self.socket_client.send_status()
+
+        def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # type: ignore[name-defined]
+            log_line("[gui] closeEvent: sending shutdown to daemon")
+            try:
+                self.socket_client.send_shutdown()
+            except Exception as exc:
+                log_line(f"[gui] closeEvent shutdown error: {exc}")
+            super().closeEvent(event)
 
     from PyQt6 import QtWidgets
 
@@ -427,121 +484,19 @@ def run_pyqt_app() -> int:
     if icon is not None:
         window.setWindowIcon(icon)
     window.show()
-    return app.exec()
-
-
-# ------------------ Tkinter / curses PyQt6 auto-installer -----------------
-
-
-def run_tk_installer() -> int:
-    try:
-        import tkinter as tk
-        from tkinter import scrolledtext
-    except Exception:
-        return run_curses_installer()
-
-    log_queue: "queue.Queue[str]" = queue.Queue()
-
-    def installer_thread() -> None:
-        cmd = [sys.executable, "-m", "pip", "install", "PyQt6"]
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
-        except Exception as exc:
-            log_queue.put(f"ERROR: could not start pip: {exc}")
-            return
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            log_queue.put(line.rstrip())
-        code = proc.wait()
-        log_queue.put(f"Installer exited with code {code}.")
-        if code == 0:
-            log_queue.put("PyQt6 installed successfully. Close this window and restart.")
-        else:
-            log_queue.put("PyQt6 install failed. See output above.")
-
-    root = tk.Tk()
-    root.title("Codex Portable - PyQt6 Auto-Installer (Tkinter)")
-    root.geometry("700x400")
-
-    text = scrolledtext.ScrolledText(root, wrap=tk.WORD)
-    text.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
-    text.insert(
-        tk.END,
-        "PyQt6 is not installed.\n\n"
-        "An automatic install has been started using pip.\n"
-        "Progress will appear here.\n\n",
-    )
-    text.config(state=tk.DISABLED)
-
-    def append_log(line: str) -> None:
-        text.config(state=tk.NORMAL)
-        text.insert(tk.END, line + "\n")
-        text.see(tk.END)
-        text.config(state=tk.DISABLED)
-
-    def poll_queue() -> None:
-        while True:
-            try:
-                line = log_queue.get_nowait()
-            except queue.Empty:
-                break
-            append_log(line)
-        root.after(100, poll_queue)
-
-    threading.Thread(target=installer_thread, daemon=True).start()
-    poll_queue()
-    root.mainloop()
-    return 0
-
-
-def run_curses_installer() -> int:
-    try:
-        import curses  # type: ignore[unused-ignore]
-    except Exception:
-        cmd = [sys.executable, "-m", "pip", "install", "PyQt6"]
-        return subprocess.call(cmd)
-
-    def _main(stdscr: "curses._CursesWindow") -> int:  # type: ignore[name-defined]
-        curses.curs_set(0)
-        stdscr.clear()
-        stdscr.addstr(0, 0, "PyQt6 is not installed. Installing automatically...")
-        stdscr.refresh()
-        cmd = [sys.executable, "-m", "pip", "install", "PyQt6"]
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        assert proc.stdout is not None
-        y = 2
-        for line in proc.stdout:
-            if y >= curses.LINES - 1:
-                stdscr.scroll(1)
-                y = curses.LINES - 2
-            stdscr.addstr(y, 0, line[: curses.COLS - 1])
-            y += 1
-            stdscr.refresh()
-        code = proc.wait()
-        stdscr.addstr(y, 0, f"Installer exited with code {code}. Press any key.")
-        stdscr.getch()
-        return code
-
-    import curses  # type: ignore[redefined-outer-name]
-
-    return curses.wrapper(_main)
+    log_line("[gui] PyQt application started")
+    rc = app.exec()
+    log_line("[gui] PyQt application exiting")
+    return rc
 
 
 def main() -> int:
     try:
         import PyQt6  # noqa: F401
-    except Exception:
-        return run_tk_installer()
+    except Exception as exc:
+        print("PyQt6 is required for this frontend:", exc)
+        log_line(f"[gui] PyQt6 import failed: {exc}")
+        return 1
     return run_pyqt_app()
 
 

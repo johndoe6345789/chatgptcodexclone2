@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 from typing import Final
 
+from .logging_utils import log_line
+
 
 HF_REPO: Final[str] = "TheBloke/deepseek-coder-6.7B-instruct-GGUF"
 HF_FILE: Final[str] = "deepseek-coder-6.7b-instruct.Q4_K_M.gguf"
@@ -22,6 +24,7 @@ def models_dir() -> Path:
 
 def log(msg: str) -> None:
     print(msg, flush=True)
+    log_line(msg)
 
 
 def ensure_huggingface_hub() -> None:
@@ -109,13 +112,16 @@ def run_llama_server(model_path: Path) -> int:
     )
     assert proc.stdout is not None
     for line in proc.stdout:
-        print("[llama] " + line.rstrip(), flush=True)
+        msg = "[llama] " + line.rstrip()
+        print(msg, flush=True)
+        log_line(msg)
     code = proc.wait()
     log(f"[helper] llama_cpp.server exited with code {code}.")
     return code
 
 
 def main() -> int:
+    log("[helper] backend_helper starting up")
     try:
         model_path = download_model()
     except Exception as exc:
@@ -124,7 +130,9 @@ def main() -> int:
     if not ensure_llama_cpp():
         log("[helper] Exiting without starting backend.")
         return 0
-    return run_llama_server(model_path)
+    rc = run_llama_server(model_path)
+    log("[helper] backend_helper shutting down")
+    return rc
 
 
 if __name__ == "__main__":
